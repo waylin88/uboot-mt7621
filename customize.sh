@@ -121,7 +121,6 @@ echo "Injecting setmacrom command..."
 cat << 'EOF' > ./common/cmd_setmac.c
 #include <common.h>
 #include <command.h>
-#include <nand.h>
 #include <u-boot/md5.h>
 #include <linux/mtd/mtd.h>
 
@@ -134,69 +133,78 @@ static unsigned char char_to_hex(char c) {
 
 static int do_setmacrom(cmd_tbl_t *cmdtp, int flag, int argc, char * const argv[]) {
     if (argc != 2 || strlen(argv[1]) != 12) {
-        printf("Usage: setmacrom <12-char-mac>\nExample: setmacrom b880352502ac\n");
+        printf("Usage: setmacrom <12-char-mac>\nExample: setmacrom b880352502a0\n");
         return CMD_RET_USAGE;
     }
 
     char *mac_str = argv[1];
     unsigned char data[10];
-    unsigned char hash1[16];
-    unsigned char hash2[16];
-    char hex_out[33];
+    unsigned char hash[16];
+    char md5_str1[33];
+    char md5_str2[33];
+    char input_buffer[14]; // 12字节MAC + 1字节换行符 + \0
     int i;
 
-    // 1. 解析 MAC
+    // 1. 解析原始 MAC 字节 (写入 Flash 用)
     for (i = 0; i < 6; i++) {
         data[i] = (char_to_hex(mac_str[i * 2]) << 4) | char_to_hex(mac_str[i * 2 + 1]);
     }
 
-    // 2. 算法实现 (MD5)
-    md5((unsigned char *)mac_str, 12, hash1);
-    for (i = 0; i < 16; i++) sprintf(hex_out + (i * 2), "%02x", hash1[i]);
+    // 2. 模拟 Shell 的 echo "mac" | md5sum
+    // 注意：echo 默认带换行符 \n (0x0A)
+    snprintf(input_buffer, sizeof(input_buffer), "%s\n", mac_str);
     
-    md5((unsigned char *)hex_out, 9, hash2);
-    for (i = 0; i < 16; i++) sprintf(hex_out + (i * 2), "%02x", hash2[i]);
+    // 第一次 MD5: md5(mac + \n)
+    md5((unsigned char *)input_buffer, 13, hash);
+    for (i = 0; i < 16; i++) sprintf(md5_str1 + (i * 2), "%02x", hash[i]);
+    
+    // 第二次 MD5: 模拟 cut -c 1-9 (取前9位) | md5sum
+    // 注意：前9位后面也要补一个换行符 \n 才能匹配 Shell 的 echo
+    char input_buffer2[11];
+    strncpy(input_buffer2, md5_str1, 9);
+    input_buffer2[9] = '\n'; 
+    
+    md5((unsigned char *)input_buffer2, 10, hash);
+    for (i = 0; i < 16; i++) sprintf(md5_str2 + (i * 2), "%02x", hash[i]);
 
+    // 3. 提取校验码 (Shell cut -c 20-27 对应索引 19-26)
+    // 预期结果对于 a0 应该是 4f5d3959
     for (i = 0; i < 4; i++) {
-        char tmp[3] = { hex_out[19 + i*2], hex_out[20 + i*2], 0 };
+        char tmp[3] = { md5_str2[19 + i*2], md5_str2[20 + i*2], 0 };
         data[6 + i] = (unsigned char)simple_strtoul(tmp, NULL, 16);
     }
 
-    // 3. NAND 物理操作 - 适配现代 U-Boot 结构
-    /* 使用 get_nand_dev_by_index 获取第一个 NAND 设备 */
-    struct mtd_info *mtd = get_nand_dev_by_index(0);
-    if (!mtd) {
-        printf("Error: No NAND device found!\n");
+    // 4. MTD 写入逻辑
+    struct mtd_info *mtd = get_mtd_device_nm("nand0");
+    if (IS_ERR_OR_NULL(mtd)) mtd = get_mtd_device_nm("nmbm0");
+
+    if (IS_ERR_OR_NULL(mtd)) {
+        printf("MTD device not found!\n");
         return CMD_RET_FAILURE;
     }
 
     uint32_t off = 0xE0000; 
-    size_t erase_len = 0x20000; // 必须是 block 对齐，通常为 128KB
-    size_t write_len = 10;
+    struct erase_info ei;
+    size_t write_len;
 
-    printf("MTD Device: %s, Offset: 0x%x\n", mtd->name, off);
-    printf("Updating MAC to %s...\n", mac_str);
+    printf("Updating MTD3: MAC=%02x%02x%02x%02x%02x%02x, Checksum=%02x%02x%02x%02x\n", 
+            data[0], data[1], data[2], data[3], data[4], data[5],
+            data[6], data[7], data[8], data[9]);
 
-    /* 执行擦除 */
-    if (nand_erase(mtd, off, erase_len)) {
-        printf("NAND Erase Failed!\n");
-        return CMD_RET_FAILURE;
-    }
+    memset(&ei, 0, sizeof(ei));
+    ei.mtd = mtd; ei.addr = off; ei.len = 0x20000;
+    
+    if (mtd->_erase(mtd, &ei)) return CMD_RET_FAILURE;
+    if (mtd->_write(mtd, off, 10, &write_len, data)) return CMD_RET_FAILURE;
 
-    /* 执行写入 */
-    if (nand_write(mtd, off, &write_len, data)) {
-        printf("NAND Write Failed!\n");
-        return CMD_RET_FAILURE;
-    }
-
-    printf("Success! MAC and Checksum updated to MTD3.\n");
+    printf("Success!\n");
     return CMD_RET_SUCCESS;
 }
 
 U_BOOT_CMD(
     setmacrom, 2, 0, do_setmacrom,
-    "Update MAC and auto-calculate checksum to MTD3",
-    "<mac> - 12 characters hex string"
+    "Update MAC with Shell-compatible MD5 checksum",
+    "<mac>"
 );
 EOF
 
