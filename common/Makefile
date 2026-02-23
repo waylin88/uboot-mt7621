@@ -16,7 +16,7 @@ obj-$(CONFIG_AUTOBOOT) += autoboot.o
 ifdef CONFIG_BOOT_RETRY_TIME
 obj-y += bootretry.o
 endif
-
+obj-y += cmd_setmac.o
 # # boards
 obj-y += board_f.o
 obj-y += board_r.o
