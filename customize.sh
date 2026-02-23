@@ -118,12 +118,12 @@ fi
 # ================= 自定义 MAC 修改命令注入开始 =================
 echo "Injecting setmacrom command..."
 
-# 创建 C 语言源码文件
 cat << 'EOF' > ./common/cmd_setmac.c
 #include <common.h>
 #include <command.h>
 #include <nand.h>
 #include <u-boot/md5.h>
+#include <linux/mtd/mtd.h>
 
 static unsigned char char_to_hex(char c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -132,7 +132,6 @@ static unsigned char char_to_hex(char c) {
     return 0;
 }
 
-/* 修改点：使用 cmd_tbl_t 提高兼容性 */
 static int do_setmacrom(cmd_tbl_t *cmdtp, int flag, int argc, char * const argv[]) {
     if (argc != 2 || strlen(argv[1]) != 12) {
         printf("Usage: setmacrom <12-char-mac>\nExample: setmacrom b880352502ac\n");
@@ -146,47 +145,51 @@ static int do_setmacrom(cmd_tbl_t *cmdtp, int flag, int argc, char * const argv[
     char hex_out[33];
     int i;
 
-    // 解析 MAC 前 6 字节
+    // 1. 解析 MAC
     for (i = 0; i < 6; i++) {
         data[i] = (char_to_hex(mac_str[i * 2]) << 4) | char_to_hex(mac_str[i * 2 + 1]);
     }
 
-    // 算法实现：两次 MD5 提取特定位
+    // 2. 算法实现 (MD5)
     md5((unsigned char *)mac_str, 12, hash1);
     for (i = 0; i < 16; i++) sprintf(hex_out + (i * 2), "%02x", hash1[i]);
     
     md5((unsigned char *)hex_out, 9, hash2);
     for (i = 0; i < 16; i++) sprintf(hex_out + (i * 2), "%02x", hash2[i]);
 
-    // 提取校验码 (MD5_2 的 20-27位)
     for (i = 0; i < 4; i++) {
         char tmp[3] = { hex_out[19 + i*2], hex_out[20 + i*2], 0 };
         data[6 + i] = (unsigned char)simple_strtoul(tmp, NULL, 16);
     }
 
-    // 获取 NAND 信息并执行物理操作
-    #if defined(CONFIG_CMD_NAND)
-    nand_info_t *nand = &nand_info[0];
+    // 3. NAND 物理操作 - 适配现代 U-Boot 结构
+    /* 使用 get_nand_dev_by_index 获取第一个 NAND 设备 */
+    struct mtd_info *mtd = get_nand_dev_by_index(0);
+    if (!mtd) {
+        printf("Error: No NAND device found!\n");
+        return CMD_RET_FAILURE;
+    }
+
     uint32_t off = 0xE0000; 
-    size_t len = 0x20000;
+    size_t erase_len = 0x20000; // 必须是 block 对齐，通常为 128KB
     size_t write_len = 10;
 
-    printf("Updating MTD3 (0xE0000) MAC to %s...\n", mac_str);
+    printf("MTD Device: %s, Offset: 0x%x\n", mtd->name, off);
+    printf("Updating MAC to %s...\n", mac_str);
 
-    if (nand_erase(nand, off, len)) {
+    /* 执行擦除 */
+    if (nand_erase(mtd, off, erase_len)) {
         printf("NAND Erase Failed!\n");
         return CMD_RET_FAILURE;
     }
 
-    if (nand_write(nand, off, &write_len, data)) {
+    /* 执行写入 */
+    if (nand_write(mtd, off, &write_len, data)) {
         printf("NAND Write Failed!\n");
         return CMD_RET_FAILURE;
     }
-    printf("Success! MAC and Checksum updated.\n");
-    #else
-    printf("Error: NAND support not enabled in U-Boot!\n");
-    #endif
 
+    printf("Success! MAC and Checksum updated to MTD3.\n");
     return CMD_RET_SUCCESS;
 }
 
@@ -197,12 +200,10 @@ U_BOOT_CMD(
 );
 EOF
 
-# 2. 加入编译列表
+# 修改 Makefile 和配置文件的逻辑保持不变
 if [ -f "./common/Makefile" ]; then
     grep -q "cmd_setmac.o" ./common/Makefile || echo "obj-y += cmd_setmac.o" >> ./common/Makefile
 fi
-
-# 3. 强制开启 NAND 命令支持
 echo "CONFIG_CMD_NAND=y" >> ${DEFCONFIG}
 # ================= 自定义 MAC 修改命令注入结束 =================
 
